@@ -1,14 +1,24 @@
--- TSB - Halloween Auto Farm v5.0  (Obsidian UI, mobile friendly)
+-- TSB - Halloween Auto Farm v6.0  (Obsidian UI, mobile friendly)
 -- Owner: lo6 | selam0exe   -   Discord: godvillage.
 -- Server: https://discord.gg/PDyTWAEkPt
 --
--- Priority: Kill (Pinata first) > Shop re-roll > Collect candy > Open doors > Visit trashcans
+-- Priority: Kill (Penyta first) > Shop re-roll > Collect candy > Open doors > Visit trashcans
 --
--- Main    : auto doors, auto trashcans, auto kill + skills 1-4, auto candy, shop re-roll
--- Visuals : door ESP, NPC ESP (live HP), player ESP, fullbright
--- Player  : walkspeed, jump, infinite jump, fly, noclip, dash (adjustable distance), FPS boost, utilities
--- Names   : every name used by the script can be changed there + "Scan to console"
--- Settings: credits, config save/load, themes
+-- Main     : auto doors, auto trashcans, auto kill + skills 1-4 + auto ultimate, auto candy, shop re-roll
+-- Visuals  : door ESP, NPC ESP (live HP), player ESP, fullbright
+-- Player   : walkspeed, jump, infinite jump, fly, noclip, dash (adjustable distance), FPS boost, utilities
+-- Webhooks : paste your Discord webhook, get alerts when Penyta dies (+ who, best effort) and candy milestones
+-- Settings : credits, config save/load, themes, and all the name settings (the separate Names tab is gone)
+--
+-- NOTES
+-- - "Who killed Penyta" is best-effort: the game may not expose a killer tag we can read reliably.
+--   If it only ever says "Unknown", tell the owner so the detection can be adjusted.
+-- - The door approach now offsets away from the door's own facing and temporarily disables
+--   collision while standing there, to stop the camera from clipping into nearby tree geometry.
+--   This is a practical fix, not a guaranteed one - if it still happens, raise the "Door forward
+--   offset" slider in Main > Movement.
+-- - FPS boost now re-applies itself continuously instead of once, and forces render quality down.
+--   Actual FPS gained depends on your device; turning it off restores everything.
 --
 -- If something fails, the console prints "[TSB] ..." lines. Send the last one to the owner.
 
@@ -26,6 +36,7 @@ local GuiService = game:GetService("GuiService")
 local UserInputService = game:GetService("UserInputService")
 local Lighting = game:GetService("Lighting")
 local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
 
 local lp = Players.LocalPlayer
 while not lp do
@@ -58,17 +69,20 @@ pcall(function() VU = game:GetService("VirtualUser") end)
 
 -- ========== defaults / safe accessors ==========
 local DEF = {
-    MoveMode = "TP", TweenSpeed = 100, StepDelay = 0.6, DoorYOffset = -3,
+    MoveMode = "TP", TweenSpeed = 100, StepDelay = 0.6, DoorYOffset = -3, DoorForwardOffset = 4,
     CandyFilter = "Door/trash/kill drops", CandyWindow = 25, CandyRadius = 100, CandyMode = "Both", CandyDelay = 0.1,
     AttackMethod = "Auto", SkillMethod = "Auto", SkillInterval = 1.5,
     KillDist = 3, AttackDelay = 0.12, KillRange = 300, RerollCost = 500,
     FlySpeed = 60, WalkSpeedValue = 32, JumpValue = 60, DashDistance = 40,
+    UltInterval = 1, UltKey = "R",
     PromptKeys = "trick or treat", DoorKeys = "door", TrashKeys = "trashcan", NpcKeys = "zombie",
-    BossKeys = "boss", PinataKeys = "pinata", ExcludeKeys = "dummy", CandyFolder = "CandyVisuals",
+    BossKeys = "boss", PinataKeys = "penyta", ExcludeKeys = "dummy", CandyFolder = "CandyVisuals",
     CandyNames = "candy, blox, choco", ShopKeys = "shopkeeper", RerollKeys = "reroll", CandyCountPath = "",
     DoorESPColor = Color3.fromRGB(255, 170, 0),
     NpcESPColor = Color3.fromRGB(255, 60, 60),
     PlayerESPColor = Color3.fromRGB(80, 170, 255),
+    WebhookURL = "",
+    CandyMilestone = 500,
 }
 
 local function T(n)
@@ -114,9 +128,14 @@ local doorList, doorScanAt = {}, 0
 local trashList, trashScanAt = {}, 0
 local learned, learning, learnBuf, hookInstalled = {}, nil, {}, false
 local lastSkill = { 0, 0, 0, 0 }
+local lastUlt = 0
 local shopModel, shopScanAt, lastShop = nil, 0, 0
 local candyFn, candySrc, candyFnAt, candyFnPath = nil, "", 0, ""
 local candyLabel = nil
+local webhookLabel = nil
+local lastCandyMilestoneSent = 0
+local weAreAttacking = setmetatable({}, { __mode = "k" }) -- [npcModel] = true while our stepKill loop is on it
+local reportedDead = setmetatable({}, { __mode = "k" })
 local TRASH_COOLDOWN = 90
 local F = {}
 
@@ -174,6 +193,40 @@ end
 
 local function fmtNum(v)
     return tostring(math.floor((v or 0) + 0.5))
+end
+
+-- ========== webhooks ==========
+-- Finds whichever HTTP-with-headers function this executor exposes.
+local function getRequester()
+    return http_request or request or (syn and syn.request) or (fluxus and fluxus.request)
+        or (http and http.request)
+end
+
+local function sendWebhook(title, description, color, fields)
+    local url = O("WebhookURL")
+    if not url or url == "" then return false, "No webhook URL set" end
+    local req = getRequester()
+    if not req then return false, "This executor has no HTTP request function with headers" end
+    local embed = {
+        title = title,
+        description = description,
+        color = color or 15105570,
+        fields = fields,
+    }
+    local ok, body = pcall(function()
+        return HttpService:JSONEncode({ embeds = { embed } })
+    end)
+    if not ok then return false, "Could not encode webhook payload" end
+    local ok2, res = pcall(function()
+        return req({
+            Url = url,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = body,
+        })
+    end)
+    if not ok2 then return false, tostring(res) end
+    return true
 end
 
 local function refreshKeys()
@@ -532,6 +585,75 @@ local function useSkills()
     return false
 end
 
+-- ========== ultimate ==========
+-- Best-effort readiness check: looks for a GUI element whose name mentions
+-- "ultimate"/"ult" and reads a fill bar (Frame/ImageLabel Size.X.Scale) or a
+-- NumberValue/attribute called Charge/Value/Cooldown. If nothing matching is
+-- found, "Ignore readiness check" makes it just try on the interval instead.
+local function scanUltReady()
+    local pg = lp:FindFirstChildOfClass("PlayerGui")
+    if not pg then return nil end
+    local best = nil
+    for _, d in ipairs(pg:GetDescendants()) do
+        local lname = string.lower(d.Name)
+        if string.find(lname, "ult", 1, true) then
+            if (d:IsA("Frame") or d:IsA("ImageLabel")) and d.Size then
+                local scale = d.Size.X.Scale
+                if scale > 0 then
+                    best = (best == nil) and (scale >= 0.98) or (best or (scale >= 0.98))
+                end
+            end
+            for _, attrName in ipairs({ "Charge", "Value", "Progress", "Percent" }) do
+                local okA, v = pcall(function() return d:GetAttribute(attrName) end)
+                if okA and type(v) == "number" then
+                    best = (v >= 99) or best
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function useUlt()
+    local method = O("SkillMethod")
+    if method ~= "Key press only" then
+        if replay("ULT") then return true end
+        if method == "Learned only" then return false end
+    end
+    if VIM then
+        local code = Enum.KeyCode[O("UltKey")] or Enum.KeyCode.R
+        local ok = pcall(function()
+            VIM:SendKeyEvent(true, code, false, game)
+            task.wait(0.05)
+            VIM:SendKeyEvent(false, code, false, game)
+        end)
+        return ok
+    end
+    return false
+end
+
+-- fires the ultimate if it looks ready (or always, if the user chose to skip the check)
+local function stepUlt()
+    if not T("AutoUlt") then return false end
+    local now = os.clock()
+    if now - lastUlt < O("UltInterval") then return false end
+    local ready = T("UltIgnoreReady")
+    if not ready then
+        local detected = scanUltReady()
+        if detected == nil then
+            -- couldn't find a readable ult bar at all; don't spam blindly unless asked to
+            return false
+        end
+        ready = detected
+    end
+    if ready then
+        lastUlt = now
+        useUlt()
+        return true
+    end
+    return false
+end
+
 -- ========== invisible (others, experimental) ==========
 local function setInvisOthers(on)
     if on then
@@ -600,6 +722,57 @@ local function nearSpot(pos)
 end
 
 -- ========== NPCs / health ==========
+
+-- Best-effort killer lookup. TSB may not expose this at all, in which case
+-- this keeps returning "Unknown" - that's a game limitation, not a bug here.
+local function findKiller(m, hum)
+    if weAreAttacking[m] then
+        return lp.Name .. " (you)"
+    end
+    local holders = { m, hum }
+    for _, h in ipairs(holders) do
+        if h then
+            local okc, creator = pcall(function() return h:FindFirstChild("creator") end)
+            if okc and creator and creator:IsA("ObjectValue") and creator.Value then
+                local v = creator.Value
+                if v:IsA("Player") then return v.Name end
+                local plr = Players:GetPlayerFromCharacter(v)
+                if plr then return plr.Name end
+                return v.Name
+            end
+            for _, attrName in ipairs({ "Killer", "Tagger", "LastHitBy", "DamageSource" }) do
+                local oka, v = pcall(function() return h:GetAttribute(attrName) end)
+                if oka and type(v) == "string" and v ~= "" then
+                    return v
+                end
+            end
+        end
+    end
+    return "Unknown"
+end
+
+local function hookPenytaDeath(m)
+    local hum = m:FindFirstChildOfClass("Humanoid")
+    if not hum or reportedDead[m] then return end
+    reportedDead[m] = true
+    track(hum.Died:Connect(function()
+        if not T("WebhookOnKill") then return end
+        local killer = findKiller(m, hum)
+        local candy, src = getCandyCount()
+        task.spawn(function()
+            sendWebhook(
+                "Penyta down",
+                m.Name .. " was killed.",
+                3066993,
+                {
+                    { name = "Killed by", value = killer, inline = true },
+                    { name = "Candy", value = candy and (fmtNum(candy) .. (src ~= "" and (" (" .. src .. ")") or "")) or "unknown", inline = true },
+                }
+            )
+        end)
+    end))
+end
+
 local function registerNpc(m, silent)
     if not m or not m:IsA("Model") then return end
     if Players:GetPlayerFromCharacter(m) then return end
@@ -617,8 +790,11 @@ local function registerNpc(m, silent)
     end
     if npcSet[m] == nil then
         npcSet[m] = isP
-        if isP and not silent then
-            notify("Pinata spawned: " .. m.Name, 4)
+        if isP then
+            if not silent then
+                notify("Penyta spawned: " .. m.Name, 4)
+            end
+            pcall(hookPenytaDeath, m)
         end
     end
     if not bosses[m] and hasKeyword(m.Name, K.boss) then
@@ -1589,11 +1765,45 @@ do
     end
 
     local function fpsApply(d)
-        if isFx(d) then
+        if isFx(d) and d.Enabled then
             if fps.orig[d] == nil then
-                fps.orig[d] = d.Enabled
+                fps.orig[d] = true
             end
             d.Enabled = false
+        end
+    end
+
+    -- Re-applies every render toggle on a timer. The game (or other scripts)
+    -- can turn effects back on after we disable them once, so a single pass
+    -- is not enough - this keeps forcing them back off while FPS boost is on.
+    local function fpsReinforce()
+        pcall(function()
+            if Lighting.GlobalShadows then
+                Lighting.GlobalShadows = false
+            end
+        end)
+        pcall(function()
+            local r = settings().Rendering
+            if r.QualityLevel ~= Enum.QualityLevel.Level01 then
+                r.QualityLevel = Enum.QualityLevel.Level01
+            end
+        end)
+        pcall(function()
+            local t = Workspace:FindFirstChildOfClass("Terrain")
+            if t and (t.WaterWaveSize ~= 0 or t.WaterWaveSpeed ~= 0) then
+                t.WaterWaveSize = 0
+                t.WaterWaveSpeed = 0
+                t.WaterReflectance = 0
+            end
+        end)
+        local n = 0
+        for _, root in ipairs({ Workspace, Lighting }) do
+            for _, d in ipairs(root:GetDescendants()) do
+                n += 1
+                if n % 2000 == 0 then task.wait() end
+                if not fps.on then return end
+                pcall(fpsApply, d)
+            end
         end
     end
 
@@ -1603,33 +1813,22 @@ do
         if on then
             pcall(function()
                 fps.light = Lighting.GlobalShadows
-                Lighting.GlobalShadows = false
             end)
             pcall(function()
                 local t = Workspace:FindFirstChildOfClass("Terrain")
                 if t then
                     fps.terrain = { t, t.WaterWaveSize, t.WaterWaveSpeed, t.WaterReflectance }
-                    t.WaterWaveSize = 0
-                    t.WaterWaveSpeed = 0
-                    t.WaterReflectance = 0
                 end
             end)
             pcall(function()
-                local r = settings().Rendering
-                fps.quality = r.QualityLevel
-                r.QualityLevel = Enum.QualityLevel.Level01
+                fps.quality = settings().Rendering.QualityLevel
             end)
             fps.c1 = Workspace.DescendantAdded:Connect(function(d) pcall(fpsApply, d) end)
             fps.c2 = Lighting.DescendantAdded:Connect(function(d) pcall(fpsApply, d) end)
             task.spawn(function()
-                local n = 0
-                for _, root in ipairs({ Workspace, Lighting }) do
-                    for _, d in ipairs(root:GetDescendants()) do
-                        n += 1
-                        if n % 2000 == 0 then task.wait() end
-                        if not fps.on then return end
-                        pcall(fpsApply, d)
-                    end
+                while fps.on do
+                    pcall(fpsReinforce)
+                    task.wait(1)
                 end
             end)
         else
@@ -1737,7 +1936,7 @@ end
 -- ========== UI ==========
 local Window = Library:CreateWindow({
     Title = "TSB Halloween",
-    Footer = "Auto Farm v5.0 | by lo6 | selam0exe",
+    Footer = "Auto Farm v6.0 | by lo6 | selam0exe",
     Center = true,
     AutoShow = true,
     ShowCustomCursor = false,
@@ -1747,16 +1946,17 @@ print("[TSB] Window created")
 local TabMain = Window:AddTab("Main")
 local TabVisuals = Window:AddTab("Visuals")
 local TabPlayer = Window:AddTab("Player")
-local TabNames = Window:AddTab("Names")
+local TabWebhooks = Window:AddTab("Webhooks")
 local TabTesters = Window:AddTab("Testers")
 local TabSettings = Window:AddTab("Settings")
+local TabNames = TabSettings -- name/keyword settings now live at the bottom of Settings
 
 -- Main
 try(function()
     local G = TabMain:AddLeftGroupbox("Farm")
     G:AddToggle("AutoDoors", { Text = "Auto doors (Trick Or Treat)", Default = false })
     G:AddToggle("AutoTrash", { Text = "Auto trashcans (visit all)", Default = false })
-    G:AddToggle("AutoKill", { Text = "Auto kill (mobs + Pinata)", Default = false })
+    G:AddToggle("AutoKill", { Text = "Auto kill (mobs + Penyta)", Default = false })
     G:AddToggle("AutoCandy", {
         Text = "Auto collect candy",
         Default = false,
@@ -1779,6 +1979,7 @@ try(function()
     G:AddSlider("TweenSpeed", { Text = "Tween speed", Default = DEF.TweenSpeed, Min = 20, Max = 300, Rounding = 0, Suffix = " st/s" })
     G:AddSlider("StepDelay", { Text = "Door/trash step delay", Default = DEF.StepDelay, Min = 0.1, Max = 2, Rounding = 2, Suffix = "s" })
     G:AddSlider("DoorYOffset", { Text = "Door stand height (negative = below)", Default = DEF.DoorYOffset, Min = -10, Max = 5, Rounding = 1 })
+    G:AddSlider("DoorForwardOffset", { Text = "Door forward offset (away from tree/wall)", Default = DEF.DoorForwardOffset, Min = 0, Max = 15, Rounding = 1, Suffix = " st" })
 end)
 
 try(function()
@@ -1811,6 +2012,18 @@ try(function()
     for i = 1, 4 do
         G:AddButton({ Text = "Learn skill " .. i .. " (then tap it once)", Func = function() startLearn("S" .. i, "skill " .. i) end })
     end
+end)
+
+try(function()
+    local G = TabMain:AddLeftGroupbox("Ultimate")
+    G:AddToggle("AutoUlt", { Text = "Auto use ultimate when ready", Default = false })
+    G:AddToggle("UltIgnoreReady", { Text = "Ignore readiness check (just press every interval)", Default = false })
+    G:AddSlider("UltInterval", { Text = "Check / press interval", Default = DEF.UltInterval, Min = 0.3, Max = 15, Rounding = 1, Suffix = "s" })
+    try(function()
+        G:AddLabel("Ult key (used if nothing is learned)"):AddKeyPicker("UltKey", { Default = DEF.UltKey, NoUI = true, Text = "Ult key" })
+    end)
+    G:AddButton({ Text = "Learn ultimate (then tap it once)", Func = function() startLearn("ULT", "the ultimate") end })
+    G:AddLabel("Readiness detection looks for an on-screen ultimate bar. If your HUD doesn't expose one, turn on 'Ignore readiness check'.", true)
 end)
 
 try(function()
@@ -1899,7 +2112,7 @@ try(function()
         Default = false,
         Callback = function(v) task.spawn(F.setFps, v) end,
     })
-    G:AddLabel("Turns off particles, trails, beams, post effects, shadows and water waves and lowers graphics quality. Turning it off restores everything.", true)
+    G:AddLabel("Keeps forcing particles/trails/beams/post effects/shadows/water off and graphics quality down every second, so other scripts can't turn them back on. Turning it off restores everything. Actual FPS gain depends on your device.", true)
 end)
 
 try(function()
@@ -1937,14 +2150,41 @@ try(function()
     G:AddButton({ Text = "Teleport to selected player", Func = function() F.tpToPlayer(O("TPTarget")) end })
 end)
 
--- Names
+-- Webhooks
+try(function()
+    local G = TabWebhooks:AddLeftGroupbox("Discord webhook")
+    G:AddInput("WebhookURL", { Text = "Webhook URL", Default = "", Placeholder = "https://discord.com/api/webhooks/..." })
+    G:AddToggle("WebhookOnKill", { Text = "Send an alert when Penyta dies", Default = false })
+    G:AddToggle("WebhookOnCandy", { Text = "Send a candy milestone alert", Default = false })
+    G:AddSlider("CandyMilestone", { Text = "Milestone step", Default = DEF.CandyMilestone, Min = 100, Max = 5000, Rounding = 0 })
+    webhookLabel = G:AddLabel("", true)
+    G:AddButton({
+        Text = "Send test message",
+        Func = function()
+            task.spawn(function()
+                local ok, err = sendWebhook("Test message", "If you can see this, the webhook works.", 3447003)
+                if webhookLabel then
+                    webhookLabel:SetText(ok and "Test sent" or ("Failed: " .. tostring(err)))
+                end
+            end)
+        end,
+    })
+end)
+
+try(function()
+    local G = TabWebhooks:AddRightGroupbox("About")
+    G:AddLabel("Get a webhook URL from your Discord server: Channel Settings > Integrations > Webhooks > New Webhook > Copy URL.", true)
+    G:AddLabel("The \"Killed by\" field is best-effort. If the game doesn't expose who damaged an NPC, it will show as Unknown - that's a limit of what TSB shares with the client, not a bug in this script.", true)
+end)
+
+-- Names (folded into the Settings tab, no separate tab for this anymore)
 try(function()
     local G = TabNames:AddLeftGroupbox("Names (comma separated)")
     G:AddInput("PromptKeys", { Text = "Prompt to press", Default = DEF.PromptKeys })
     G:AddInput("DoorKeys", { Text = "Door name (empty = no filter)", Default = DEF.DoorKeys })
     G:AddInput("TrashKeys", { Text = "Trashcan name", Default = DEF.TrashKeys })
     G:AddInput("NpcKeys", { Text = "NPC name to kill", Default = DEF.NpcKeys })
-    G:AddInput("PinataKeys", { Text = "Pinata name", Default = DEF.PinataKeys })
+    G:AddInput("PinataKeys", { Text = "Penyta name", Default = DEF.PinataKeys })
     G:AddInput("BossKeys", { Text = "Boss name", Default = DEF.BossKeys })
     G:AddInput("ExcludeKeys", { Text = "Exclude from ESP/kill", Default = DEF.ExcludeKeys })
     G:AddToggle("TrashHit", { Text = "Hit trashcan (M1) if it has no prompt", Default = true })
@@ -2054,6 +2294,7 @@ local function stepKill()
     local t0 = os.clock()
     local lastPos = nil
     local killed = false
+    weAreAttacking[m] = true
     while alive and T("AutoKill") and m.Parent and os.clock() - t0 < limit do
         local root = rootOf(m)
         local me = getHRP()
@@ -2076,12 +2317,14 @@ local function stepKill()
             end
         end
         useSkills()
+        stepUlt()
         attackClick()
         task.wait(O("AttackDelay"))
     end
     if not m.Parent then
         killed = true
     end
+    task.delay(2, function() weAreAttacking[m] = nil end) -- keep the flag briefly for the Died event
     if killed then
         if lastPos then addSpot(lastPos) end
     elseif m.Parent then
@@ -2131,7 +2374,7 @@ end
 
 local function stepDoor()
     if not T("AutoDoors") then return false end
-    if T("AutoKill") and pinataAlive() then return false end -- Pinata first, ignore doors
+    if T("AutoKill") and pinataAlive() then return false end -- Penyta first, ignore doors
     refreshDoors()
     for _, p in ipairs(doorList) do
         if p.Parent and p.Enabled and (os.clock() - (doorCooldown[p] or -100)) > 15 then
@@ -2141,7 +2384,20 @@ local function stepDoor()
                 doorCooldown[p] = os.clock()
                 ensureOrigin(hrp)
                 addSpot(pos)
-                moveTo(CFrame.new(pos + Vector3.new(0, O("DoorYOffset"), 0)))
+                -- stand off to the side of the door (away from its facing) instead of
+                -- right on top of it, and briefly drop collision: both stop the camera
+                -- from getting pushed/clipped by nearby tree geometry
+                local target, part = doorInfo(p)
+                local standCf = CFrame.new(pos + Vector3.new(0, O("DoorYOffset"), 0))
+                if part then
+                    local fwd = part.CFrame.LookVector
+                    if fwd.Magnitude > 0.1 then
+                        standCf = CFrame.new(part.Position + fwd * O("DoorForwardOffset") + Vector3.new(0, O("DoorYOffset"), 0))
+                    end
+                end
+                local wasCollide = hrp.CanCollide
+                pcall(function() hrp.CanCollide = false end)
+                moveTo(standCf)
                 task.wait(O("StepDelay"))
                 for _ = 1, 2 do
                     if T("AutoKill") and pinataAlive() then break end
@@ -2149,6 +2405,8 @@ local function stepDoor()
                     task.wait(O("StepDelay"))
                     if not (p.Parent and p.Enabled) then break end
                 end
+                local h2 = getHRP()
+                if h2 then pcall(function() h2.CanCollide = wasCollide end) end
                 addSpot(pos)
                 return true
             end
@@ -2239,6 +2497,7 @@ end))
 
 track(RunService.Heartbeat:Connect(function()
     pcall(F.playerTick)
+    pcall(stepUlt)
 end))
 
 track(RunService.Stepped:Connect(function()
@@ -2311,12 +2570,24 @@ end)
 task.spawn(function()
     while alive do
         pcall(function()
+            local c, src = getCandyCount()
             if candyLabel then
-                local c, src = getCandyCount()
                 if c then
                     candyLabel:SetText("Candy: " .. fmtNum(c) .. " (" .. src .. ")")
                 else
-                    candyLabel:SetText("Candy: not found (set the path in Names)")
+                    candyLabel:SetText("Candy: not found (set the path in Settings)")
+                end
+            end
+            if c and T("WebhookOnCandy") then
+                local step = O("CandyMilestone")
+                if step > 0 then
+                    local reached = math.floor(c / step) * step
+                    if reached > 0 and reached > lastCandyMilestoneSent then
+                        lastCandyMilestoneSent = reached
+                        task.spawn(function()
+                            sendWebhook("Candy milestone", lp.Name .. " reached " .. fmtNum(reached) .. " candy.", 15844367)
+                        end)
+                    end
                 end
             end
         end)
@@ -2355,7 +2626,7 @@ task.spawn(function()
     end
 end)
 
-notify("Loaded v5.0. First: Main > Kill > Learn M1 / Skills > Learn skill.", 6)
+notify("Loaded v6.0. First: Main > Kill > Learn M1 / Skills > Learn skill / Ultimate > Learn ultimate.", 6)
 print("[TSB] Loaded OK")
 
 end
