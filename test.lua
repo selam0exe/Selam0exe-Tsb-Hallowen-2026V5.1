@@ -2204,6 +2204,7 @@ end)
 try(function()
     local G = TabTesters:AddLeftGroupbox("Testers")
     G:AddLabel("Grim_Reaper - Tester", true)
+    G:AddLabel("notagoodhackayt - Tester", true)
 end)
 
 -- Settings
